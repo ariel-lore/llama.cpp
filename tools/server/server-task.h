@@ -23,6 +23,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
+    SERVER_TASK_TYPE_INTROSPECT,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -574,6 +575,15 @@ struct server_task_result_slots : server_task_result {
     virtual json to_json() override;
 };
 
+// used by SERVER_TASK_TYPE_INTROSPECT, the json is built on the main loop where the server state can be read
+struct server_task_result_introspect : server_task_result {
+    json data = json::object();
+
+    virtual json to_json() override {
+        return data;
+    }
+};
+
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
@@ -678,6 +688,12 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // number of entries dropped to stay within the limits (the "removing oldest entry" warnings)
+    uint64_t n_evicted = 0;
+
+    // number of prompts not saved because they alone exceed the size limit (the "exceeds cache size limit" warnings)
+    uint64_t n_rejected = 0;
 
     size_t size() const;
 

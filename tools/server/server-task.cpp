@@ -1734,6 +1734,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0 && state_size_new > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        n_rejected++;
         return nullptr;
     }
 
@@ -1757,6 +1758,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                     states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            n_evicted++;
         }
     }
 
@@ -1876,6 +1878,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            n_evicted++;
         }
     }
 
@@ -1891,6 +1894,7 @@ void server_prompt_cache::update() {
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+            n_evicted++;
         }
     }
 

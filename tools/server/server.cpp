@@ -247,6 +247,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
+        routes.get_introspect              = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
         // custom routes for router
@@ -301,6 +302,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+    ctx_http.get ("/introspect",               ex_wrapper(routes.get_introspect));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
     // resumable streaming: a child binds the local session factories, the router binds

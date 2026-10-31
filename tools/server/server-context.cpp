@@ -18,9 +18,12 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_get_memory_breakdown (used by /introspect)
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -364,6 +367,9 @@ struct server_slot {
 
     server_slot_stats stats;
 
+    // stats of the last finished task, kept after reset() for /introspect
+    server_slot_stats stats_last;
+
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
@@ -600,6 +606,8 @@ struct server_slot {
             }
 
             callback_on_reset(*this);
+
+            stats_last = stats;
 
             reset();
 
@@ -937,6 +945,58 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 //
 // server_context_impl (private implementation)
 //
+
+// a byte count as both bytes and MiB, the MiB value matches the "... buffer size = X MiB" load logs
+static void introspect_set_size(json & obj, const std::string & key, size_t n_bytes) {
+    obj[key + "_bytes"] = n_bytes;
+    obj[key + "_mib"]   = std::round(n_bytes / (1024.0 * 1024.0) * 1000.0) / 1000.0;
+}
+
+// memory allocated by a context, per buffer type (e.g. CUDA0, CUDA_Host, CPU)
+// model   - model weights          ("model buffer size" logs)
+// kv      - KV cache and recurrent state ("KV buffer size" / "RS buffer size" logs)
+// compute - temporary compute buffers ("compute buffer size" logs)
+// with include_model = false the model weights are skipped, for a context that shares the model of another one
+static json introspect_memory_breakdown(const llama_context * ctx, bool include_model) {
+    json res = json::array();
+
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        const size_t n_model = include_model ? mb.model : 0;
+        if (n_model + mb.context + mb.compute == 0) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+        json cur = {
+            {"buffer_type", ggml_backend_buft_name(buft)},
+            {"device",      dev ? ggml_backend_dev_name(dev) : ""},
+            {"is_host",     ggml_backend_buft_is_host(buft)},
+        };
+        if (include_model) {
+            introspect_set_size(cur, "model", n_model);
+        }
+        introspect_set_size(cur, "kv", mb.context);
+        introspect_set_size(cur, "compute", mb.compute);
+
+        res.push_back(std::move(cur));
+    }
+
+    return res;
+}
+
+static json introspect_checkpoint(const common_prompt_checkpoint & ckpt) {
+    json res = {
+        {"n_tokens", ckpt.n_tokens},
+        {"pos_min",  ckpt.pos_min},
+        {"pos_max",  ckpt.pos_max},
+    };
+    introspect_set_size(res, "size",       ckpt.size());
+    introspect_set_size(res, "size_main",  ckpt.data_tgt.size());
+    introspect_set_size(res, "size_draft", ckpt.data_dft.size());
+
+    return res;
+}
 
 struct server_context_impl {
     friend struct server_context;
@@ -2817,6 +2877,114 @@ private:
         return n_read;
     }
 
+    // live state for GET /introspect: memory per backend buffer, slots with their checkpoints, the host prompt cache
+    // note: must run on the main loop, outside of a decode
+    json introspect() const {
+        json res = json::object();
+
+        // contexts - where the KV cache lives and how big it is
+        {
+            json main = {
+                {"n_ctx",         llama_n_ctx(ctx_tgt)},
+                {"n_ctx_seq",     llama_n_ctx_seq(ctx_tgt)},
+                {"type_k",        ggml_type_name(params_base.cache_type_k)},
+                {"type_v",        ggml_type_name(params_base.cache_type_v)},
+                {"kv_offload",    !params_base.no_kv_offload},
+                {"kv_unified",    params_base.kv_unified},
+                {"memory",        introspect_memory_breakdown(ctx_tgt, true)},
+            };
+            res["main"] = std::move(main);
+        }
+
+        if (ctx_dft) {
+            const bool shared = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
+
+            json draft = {
+                {"n_ctx",                  llama_n_ctx(ctx_dft)},
+                {"n_ctx_seq",              llama_n_ctx_seq(ctx_dft)},
+                {"type_k",                 ggml_type_name(params_base.speculative.draft.cache_type_k)},
+                {"type_v",                 ggml_type_name(params_base.speculative.draft.cache_type_v)},
+                {"model_shared_with_main", shared},
+                {"memory",                 introspect_memory_breakdown(ctx_dft, !shared)},
+            };
+            res["draft"] = std::move(draft);
+        } else {
+            res["draft"] = nullptr;
+        }
+
+        // slots - tokens in the KV cache and the context checkpoints (checkpoints are always in host RAM)
+        {
+            json arr = json::array();
+
+            for (const server_slot & slot : slots) {
+                json cur = {
+                    {"id",            slot.id},
+                    {"is_processing", slot.is_processing()},
+                    {"n_ctx",         slot.n_ctx},
+                    {"n_tokens",      slot.prompt.n_tokens()},
+                    {"pos_min",       llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id)},
+                    {"pos_max",       llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id)},
+                };
+
+                // the size of the slot state in the KV cache, i.e. what a save to the prompt cache would copy to RAM
+                const size_t n_state_main =           llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t n_state_dft  = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                introspect_set_size(cur, "state_main",  n_state_main);
+                introspect_set_size(cur, "state_draft", n_state_dft);
+
+                size_t n_ckpt_bytes = 0;
+                json ckpts = json::array();
+                for (const auto & ckpt : slot.prompt.checkpoints) {
+                    n_ckpt_bytes += ckpt.size();
+                    ckpts.push_back(introspect_checkpoint(ckpt));
+                }
+                cur["checkpoints"] = {
+                    {"n",     slot.prompt.checkpoints.size()},
+                    {"n_max", params_base.n_ctx_checkpoints},
+                    {"list",  std::move(ckpts)},
+                };
+                introspect_set_size(cur["checkpoints"], "total", n_ckpt_bytes);
+
+                // timings of the running task (null when idle) and of the last finished one (null if none yet)
+                cur["current"]       = slot.is_processing() && slot.stats.is_set() ? slot.stats.to_json() : json(nullptr);
+                cur["last_finished"] = slot.stats_last.is_set() ? slot.stats_last.to_json() : json(nullptr);
+
+                arr.push_back(std::move(cur));
+            }
+
+            res["slots"] = std::move(arr);
+        }
+
+        // host prompt cache (--cache-ram) - always in host RAM
+        if (prompt_cache) {
+            json entries = json::array();
+            for (const auto & state : prompt_cache->states) {
+                json cur = {
+                    {"n_tokens",      state.prompt.n_tokens()},
+                    {"n_checkpoints", state.prompt.checkpoints.size()},
+                };
+                introspect_set_size(cur, "size", state.size());
+                entries.push_back(std::move(cur));
+            }
+
+            json pc = {
+                {"n_entries",    prompt_cache->states.size()},
+                {"n_tokens",     prompt_cache->n_tokens()},
+                {"limit_tokens", prompt_cache->limit_tokens},
+                {"n_evicted",    prompt_cache->n_evicted},
+                {"n_rejected",   prompt_cache->n_rejected},
+                {"entries",      std::move(entries)}, // oldest first, the oldest one is evicted first
+            };
+            introspect_set_size(pc, "size",  prompt_cache->size());
+            introspect_set_size(pc, "limit", prompt_cache->limit_size); // 0 = no limit
+            res["prompt_cache"] = std::move(pc);
+        } else {
+            res["prompt_cache"] = nullptr;
+        }
+
+        return res;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2986,6 +3154,14 @@ private:
                     res->id           = task.id;
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
+
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_INTROSPECT:
+                {
+                    auto res = std::make_unique<server_task_result_introspect>();
+                    res->id   = task.id;
+                    res->data = introspect();
 
                     queue_results.send(std::move(res));
                 } break;
@@ -5392,6 +5568,36 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_introspect = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.endpoint_slots) {
+            res->error(format_error_response("This server does not support introspect endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        // the state is read on the main loop, between two decodes
+        {
+            server_task task(SERVER_TASK_TYPE_INTROSPECT);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
         return res;
     };
 
