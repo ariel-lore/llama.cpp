@@ -943,6 +943,191 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 }
 
 //
+// GPU state for /introspect: NVML (all platforms) and DXGI video memory (Windows)
+// both libraries are loaded at runtime, there is no link-time dependency
+//
+
+#if defined(_WIN32)
+#include <dxgi1_4.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace introspect_nvml {
+    typedef int nvml_ret; // nvmlReturn_t, 0 = NVML_SUCCESS
+    typedef void * nvml_dev;
+    struct nvml_memory { unsigned long long total, free, used; };
+    struct nvml_util   { unsigned int gpu, memory; };
+
+    struct api {
+        bool ok = false;
+        nvml_ret (*init)();
+        nvml_ret (*get_count)(unsigned int *);
+        nvml_ret (*get_handle)(unsigned int, nvml_dev *);
+        nvml_ret (*get_name)(nvml_dev, char *, unsigned int);
+        nvml_ret (*get_memory)(nvml_dev, nvml_memory *);
+        nvml_ret (*get_util)(nvml_dev, nvml_util *);
+        nvml_ret (*get_power)(nvml_dev, unsigned int *);            // mW
+        nvml_ret (*get_link_gen)(nvml_dev, unsigned int *);
+        nvml_ret (*get_link_gen_max)(nvml_dev, unsigned int *);
+        nvml_ret (*get_link_width)(nvml_dev, unsigned int *);
+        nvml_ret (*get_link_width_max)(nvml_dev, unsigned int *);
+        nvml_ret (*get_pcie_tput)(nvml_dev, int, unsigned int *);    // counter 0 = TX, 1 = RX, KB/s
+    };
+
+    // loaded once and kept for the process lifetime
+    static const api & get() {
+        static api a = [] {
+            api r;
+#if defined(_WIN32)
+            HMODULE lib = LoadLibraryA("nvml.dll");
+            auto sym = [&](const char * name) { return lib ? (void *) GetProcAddress(lib, name) : nullptr; };
+#else
+            void * lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+            auto sym = [&](const char * name) { return lib ? dlsym(lib, name) : nullptr; };
+#endif
+            void * p[] = {
+                sym("nvmlInit_v2"), sym("nvmlDeviceGetCount_v2"), sym("nvmlDeviceGetHandleByIndex_v2"),
+                sym("nvmlDeviceGetName"), sym("nvmlDeviceGetMemoryInfo"), sym("nvmlDeviceGetUtilizationRates"),
+                sym("nvmlDeviceGetPowerUsage"), sym("nvmlDeviceGetCurrPcieLinkGeneration"), sym("nvmlDeviceGetMaxPcieLinkGeneration"),
+                sym("nvmlDeviceGetCurrPcieLinkWidth"), sym("nvmlDeviceGetMaxPcieLinkWidth"), sym("nvmlDeviceGetPcieThroughput"),
+            };
+            for (void * f : p) {
+                if (!f) {
+                    return r;
+                }
+            }
+            r.init               = (decltype(r.init))               p[0];
+            r.get_count          = (decltype(r.get_count))          p[1];
+            r.get_handle         = (decltype(r.get_handle))         p[2];
+            r.get_name           = (decltype(r.get_name))           p[3];
+            r.get_memory         = (decltype(r.get_memory))         p[4];
+            r.get_util           = (decltype(r.get_util))           p[5];
+            r.get_power          = (decltype(r.get_power))          p[6];
+            r.get_link_gen       = (decltype(r.get_link_gen))       p[7];
+            r.get_link_gen_max   = (decltype(r.get_link_gen_max))   p[8];
+            r.get_link_width     = (decltype(r.get_link_width))     p[9];
+            r.get_link_width_max = (decltype(r.get_link_width_max)) p[10];
+            r.get_pcie_tput      = (decltype(r.get_pcie_tput))      p[11];
+            r.ok = r.init() == 0;
+            return r;
+        }();
+        return a;
+    }
+}
+
+static double introspect_mib(unsigned long long n_bytes) {
+    return std::round(n_bytes / (1024.0 * 1024.0) * 1000.0) / 1000.0;
+}
+
+// per NVIDIA device (NVML index order): memory, load, power, PCIe link and PCIe throughput
+// a field is null when NVML does not support it for the device
+static json introspect_gpu_nvml() {
+    const auto & nv = introspect_nvml::get();
+    if (!nv.ok) {
+        return "nvml_unavailable";
+    }
+    unsigned int n_dev = 0;
+    if (nv.get_count(&n_dev) != 0) {
+        return "nvml_unavailable";
+    }
+    json devices = json::array();
+    for (unsigned int i = 0; i < n_dev; i++) {
+        introspect_nvml::nvml_dev dev;
+        if (nv.get_handle(i, &dev) != 0) {
+            continue;
+        }
+        auto u = [&](auto fn) -> json {
+            unsigned int v = 0;
+            return fn(dev, &v) == 0 ? json(v) : json(nullptr);
+        };
+        char name[96] = {0};
+        introspect_nvml::nvml_memory mem;
+        introspect_nvml::nvml_util   util;
+        unsigned int power_mw = 0, rx = 0, tx = 0;
+        const bool has_mem  = nv.get_memory(dev, &mem) == 0;
+        const bool has_util = nv.get_util(dev, &util) == 0;
+        const bool has_rx   = nv.get_pcie_tput(dev, 1, &rx) == 0;
+        const bool has_tx   = nv.get_pcie_tput(dev, 0, &tx) == 0;
+        devices.push_back({
+            {"index",            i},
+            {"name",             nv.get_name(dev, name, sizeof(name)) == 0 ? json(name) : json(nullptr)},
+            {"memory_used_mib",  has_mem  ? json(introspect_mib(mem.used))  : json(nullptr)},
+            {"memory_total_mib", has_mem  ? json(introspect_mib(mem.total)) : json(nullptr)},
+            {"utilization_pct",  has_util ? json(util.gpu)                  : json(nullptr)},
+            {"power_w",          nv.get_power(dev, &power_mw) == 0 ? json(power_mw / 1000.0) : json(nullptr)},
+            {"pcie_gen",         u(nv.get_link_gen)},
+            {"pcie_gen_max",     u(nv.get_link_gen_max)},
+            {"pcie_width",       u(nv.get_link_width)},
+            {"pcie_width_max",   u(nv.get_link_width_max)},
+            // NVML samples this over a short window (~20 ms), it is a snapshot, not an average since the last call
+            {"pcie_rx_mb_s",     has_rx ? json(rx / 1000.0) : json(nullptr)}, // host -> GPU
+            {"pcie_tx_mb_s",     has_tx ? json(tx / 1000.0) : json(nullptr)}, // GPU -> host
+        });
+    }
+    return devices;
+}
+
+#if defined(_WIN32)
+// above this much shared GPU memory (system RAM) in use by this process, report it as spilling
+static constexpr double INTROSPECT_SPILL_THRESHOLD_MIB = 512.0;
+
+// per hardware adapter, the video memory of THIS process as seen by WDDM:
+// local    = dedicated VRAM
+// nonlocal = shared GPU memory, i.e. allocations WDDM placed in system RAM (spill over PCIe)
+static json introspect_gpu_dxgi() {
+    typedef HRESULT (WINAPI * create_factory_t)(REFIID, void **);
+    static HMODULE lib = LoadLibraryA("dxgi.dll");
+    auto create_factory = lib ? (create_factory_t) GetProcAddress(lib, "CreateDXGIFactory1") : nullptr;
+    if (!create_factory) {
+        return "dxgi_unavailable";
+    }
+    IDXGIFactory1 * factory = nullptr;
+    if (FAILED(create_factory(__uuidof(IDXGIFactory1), (void **) &factory))) {
+        return "dxgi_unavailable";
+    }
+    json adapters = json::array();
+    IDXGIAdapter1 * adapter1 = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter1) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        IDXGIAdapter3 * adapter3 = nullptr;
+        if (SUCCEEDED(adapter1->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(adapter1->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &adapter3))) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO local    = {};
+            DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal = {};
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,     &local)) &&
+                SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
+                char name[128] = {0};
+                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+                const double nonlocal_mib = introspect_mib(nonlocal.CurrentUsage);
+                adapters.push_back({
+                    {"index",               i},
+                    {"name",                name},
+                    {"local_usage_mib",     introspect_mib(local.CurrentUsage)},
+                    {"local_budget_mib",    introspect_mib(local.Budget)},
+                    {"nonlocal_usage_mib",  nonlocal_mib},
+                    {"nonlocal_budget_mib", introspect_mib(nonlocal.Budget)},
+                    {"spilling",            nonlocal_mib > INTROSPECT_SPILL_THRESHOLD_MIB},
+                });
+            }
+            adapter3->Release();
+        }
+        adapter1->Release();
+    }
+    factory->Release();
+    return adapters;
+}
+#endif
+
+static json introspect_gpu() {
+    json res = {{"nvml", introspect_gpu_nvml()}};
+#if defined(_WIN32)
+    res["dxgi"] = introspect_gpu_dxgi();
+#endif
+    return res;
+}
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -5597,7 +5782,10 @@ void server_routes::init_routes() {
             return res;
         }
 
-        res->ok(result->to_json());
+        // read here on the HTTP thread, not on the main loop
+        json data = result->to_json();
+        data["gpu"] = introspect_gpu();
+        res->ok(data);
         return res;
     };
 
