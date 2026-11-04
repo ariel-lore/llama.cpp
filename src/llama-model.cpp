@@ -1212,6 +1212,23 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
+    // add the weights-only D3D12 resident buffer type (CUDA, Windows, GGML_CUDA_D3D12_RESIDENT=1)
+    if (split_mode != LLAMA_SPLIT_MODE_ROW) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto d3d12_buft_fn = reg ? (ggml_backend_buffer_type_t (*)(int))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_d3d12_buffer_type") : nullptr;
+        if (d3d12_buft_fn) {
+            for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                    if (auto * buft = d3d12_buft_fn((int) i)) {
+                        buft_list.emplace_back(dev, buft);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 

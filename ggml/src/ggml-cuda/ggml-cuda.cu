@@ -932,14 +932,6 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-    if (ggml_cuda_d3d12_resident_enabled()) {
-        void * d3d12 = nullptr;
-        if (ggml_cuda_d3d12_resident_alloc(buft_ctx->device, size, &dev_ptr, &d3d12)) {
-            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, d3d12);
-            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
-        }
-        GGML_LOG_WARN("%s: D3D12 resident allocation failed, falling back to cudaMalloc\n", __func__);
-    }
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
@@ -1013,6 +1005,47 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// Weights-only buffer type (GGML_CUDA_D3D12_RESIDENT=1, Windows): same interface as the CUDA buffer type
+// except allocation goes through a D3D12 heap with raised residency priority. llama.cpp puts it first in
+// the weight buffer type list only; KV cache, outputs and compute buffers use ggml_backend_cuda_buffer_type.
+static ggml_backend_buffer_t ggml_backend_cuda_d3d12_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+    ggml_cuda_set_device(buft_ctx->device);
+    void * dev_ptr = nullptr;
+    void * d3d12   = nullptr;
+    if (ggml_cuda_d3d12_resident_alloc(buft_ctx->device, size, &dev_ptr, &d3d12)) {
+        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, d3d12);
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    }
+    GGML_LOG_WARN("%s: D3D12 resident allocation failed, falling back to cudaMalloc\n", __func__);
+    return ggml_backend_cuda_buffer_type_alloc_buffer(buft, size);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_d3d12_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!ggml_cuda_d3d12_resident_enabled() || device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_buffer_type_i iface = ggml_backend_cuda_buffer_type_interface;
+            iface.alloc_buffer = ggml_backend_cuda_d3d12_buffer_type_alloc_buffer;
+            types[i] = {
+                /* .iface    = */ iface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_D3D12"},
+            };
+        }
+        initialized = true;
+    }
+    return &types[device];
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -6064,6 +6097,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_d3d12_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_d3d12_buffer_type;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
