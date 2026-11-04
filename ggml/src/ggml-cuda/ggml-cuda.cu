@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-cuda/d3d12-resident.cuh"
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -765,15 +766,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    void * d3d12 = nullptr; // set when allocated via GGML_CUDA_D3D12_RESIDENT
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, void * d3d12 = nullptr) :
+        device(device), dev_ptr(dev_ptr), d3d12(d3d12),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (d3d12) {
+            ggml_cuda_d3d12_resident_free(d3d12);
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -926,6 +932,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
+    if (ggml_cuda_d3d12_resident_enabled()) {
+        void * d3d12 = nullptr;
+        if (ggml_cuda_d3d12_resident_alloc(buft_ctx->device, size, &dev_ptr, &d3d12)) {
+            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, d3d12);
+            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+        }
+        GGML_LOG_WARN("%s: D3D12 resident allocation failed, falling back to cudaMalloc\n", __func__);
+    }
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
