@@ -126,12 +126,16 @@ bool common_arg::get_value_from_env(std::string & output) const {
     if (env == nullptr) return false;
     if (!args_neg.empty()) {
         // for compatibility, we need to check LLAMA_ARG_NO_ env as well
+        // only when the env name actually uses the LLAMA_ARG_ prefix; otherwise
+        // the replacement is a no-op and would treat the positive env as false
         std::string neg_env = env;
         string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
-        char * neg_value = std::getenv(neg_env.c_str());
-        if (neg_value) {
-            output = "0"; // falsey
-            return true;
+        if (neg_env != env) {
+            char * neg_value = std::getenv(neg_env.c_str());
+            if (neg_value) {
+                output = "0"; // falsey
+                return true;
+            }
         }
     }
     char * value = std::getenv(env);
@@ -147,7 +151,7 @@ bool common_arg::has_value_from_env() const {
         // for compatibility, we need to check LLAMA_ARG_NO_ env as well
         std::string neg_env = env;
         string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
-        if (std::getenv(neg_env.c_str())) {
+        if (neg_env != env && std::getenv(neg_env.c_str())) {
             return true;
         }
     }
@@ -239,7 +243,9 @@ std::vector<std::string> common_arg::get_env() const {
         // for compatibility, we need to add LLAMA_ARG_NO_ variant
         std::string neg_env = env;
         string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
-        result.push_back(neg_env);
+        if (neg_env != env) {
+            result.push_back(neg_env);
+        }
     }
     return result;
 }
@@ -2437,6 +2443,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_host = true;
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
+    add_opt(common_arg(
+        {"--cuda-d3d12-resident"},
+        {"--no-cuda-d3d12-resident"},
+        string_format(
+            "allocate CUDA model weights through a D3D12 heap with maximum residency priority (Windows only; default: %s)",
+            params.cuda_d3d12_resident ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.cuda_d3d12_resident = value;
+        }
+    ).set_env("GGML_CUDA_D3D12_RESIDENT"));
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(

@@ -1010,6 +1010,10 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // Weights-only buffer type (GGML_CUDA_D3D12_RESIDENT=1, Windows): same interface as the CUDA buffer type
 // except allocation goes through a D3D12 heap with raised residency priority. llama.cpp puts it first in
 // the weight buffer type list only; KV cache, outputs and compute buffers use ggml_backend_cuda_buffer_type.
+static void ggml_backend_cuda_set_d3d12_resident(bool enabled) {
+    ggml_cuda_d3d12_resident_set(enabled);
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_d3d12_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
     ggml_cuda_set_device(buft_ctx->device);
@@ -6099,6 +6103,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_d3d12_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_d3d12_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_d3d12_resident") == 0) {
+        return (void *)ggml_backend_cuda_set_d3d12_resident;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

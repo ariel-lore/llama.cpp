@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
 
@@ -1236,8 +1237,26 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+static void common_apply_cuda_d3d12_resident(bool enabled) {
+    const size_t nreg = ggml_backend_reg_count();
+    for (size_t i = 0; i < nreg; ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto fn = (void (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_d3d12_resident");
+        if (fn) {
+            fn(enabled);
+            if (enabled) {
+                LOG_INF("%s: CUDA D3D12 resident weight buffers requested\n", __func__);
+            }
+            return;
+        }
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // must run before model load (and -fit), which is when make_gpu_buft_list picks the weight buffer type
+    common_apply_cuda_d3d12_resident(params.cuda_d3d12_resident);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

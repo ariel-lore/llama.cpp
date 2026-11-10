@@ -1212,7 +1212,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
-    // add the weights-only D3D12 resident buffer type (CUDA, Windows, GGML_CUDA_D3D12_RESIDENT=1)
+    // add the weights-only D3D12 resident buffer type (CUDA, Windows, --cuda-d3d12-resident)
     if (split_mode != LLAMA_SPLIT_MODE_ROW) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto d3d12_buft_fn = reg ? (ggml_backend_buffer_type_t (*)(int))

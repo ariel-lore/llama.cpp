@@ -5,13 +5,23 @@
 #include <cstdlib>
 #include <cstring>
 
+// Set by ggml_backend_cuda_set_d3d12_resident (CLI / config.ini) before model load.
+// If the setter was never called, fall back to the env var for library users.
+static bool g_d3d12_resident_set     = false;
+static bool g_d3d12_resident_enabled = false;
+
+void ggml_cuda_d3d12_resident_set(bool enabled) {
+    g_d3d12_resident_set     = true;
+    g_d3d12_resident_enabled = enabled;
+}
+
 bool ggml_cuda_d3d12_resident_enabled() {
 #ifdef _WIN32
-    static const bool enabled = [] {
-        const char * v = getenv("GGML_CUDA_D3D12_RESIDENT");
-        return v != nullptr && strcmp(v, "0") != 0;
-    }();
-    return enabled;
+    if (g_d3d12_resident_set) {
+        return g_d3d12_resident_enabled;
+    }
+    const char * v = getenv("GGML_CUDA_D3D12_RESIDENT");
+    return v != nullptr && strcmp(v, "0") != 0;
 #else
     return false;
 #endif
